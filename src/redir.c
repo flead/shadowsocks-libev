@@ -209,7 +209,8 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             // continue to wait for recv
             return;
         } else {
-            ERROR("server recv");
+            if (errno != ECONNRESET)
+                ERROR("server recv");
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
             return;
