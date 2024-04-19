@@ -76,7 +76,7 @@ typedef struct remote {
     struct remote_ctx *send_ctx;
     struct server *server;
     uint32_t counter;
-    struct sockaddr *addr;
+    struct sockaddr *addr;      // 表示和ss-server的连接还没有建立. 建立后fd>=0, addr=NULL
 } remote_t;
 
 #endif // _REDIR_H

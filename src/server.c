@@ -408,6 +408,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
             }
         }
 
+		// 让socket支持mptcp. 这种方式可以支持Linux5.6之下的版本. Linux5.10+ 需要在socket()创建fd时传入IPPROTO_MPTCP
         if (mptcp == 1) {
             int i = 0;
             while ((mptcp = mptcp_enabled_values[i]) > 0) {
@@ -991,6 +992,8 @@ server_timeout_cb(EV_P_ ev_timer *watcher, int revents)
     remote_t *remote = server->remote;
 
     if (verbose) {
+		// 连接长时间无数据回强制端口连接.  timeout的时间可通过配置文件设置. 
+		// 一个典型的冲突:  iperf3.1 经过ss时，其控制链路大于30秒无数据回导致iperf3打流中断
         LOGI("TCP connection timeout");
     }
 
@@ -1317,7 +1320,7 @@ new_server(int fd, listen_ctx_t *listener)
     memset(server->recv_ctx, 0, sizeof(server_ctx_t));
     memset(server->send_ctx, 0, sizeof(server_ctx_t));
     balloc(server->buf, BUF_SIZE);
-    server->fd                  = fd;
+    server->fd                  = fd;	// accept fd. (也就是ss-redir会连接到这里)
     server->recv_ctx->server    = server;
     server->recv_ctx->connected = 0;
     server->send_ctx->server    = server;
@@ -1338,6 +1341,7 @@ new_server(int fd, listen_ctx_t *listener)
 
     ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
     ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
+	// 监控的时 ss-redir与ss-server之间的连接. 也就是ss-redir长时间不发消(ss-srever recv不到消息)会被该定时器监控到
     ev_timer_init(&server->recv_ctx->watcher, server_timeout_cb,
                   request_timeout, listener->timeout);
 

@@ -101,12 +101,14 @@ static struct ev_signal sigint_watcher;
 static struct ev_signal sigterm_watcher;
 static struct ev_signal sigchld_watcher;
 
+// 系统通过REDIRECT方式将数据包转发给本机的ss-redir后，ss-redir通过该函数提取原来的真正的目的地址
 static int
 getdestaddr(int fd, struct sockaddr_storage *destaddr)
 {
     socklen_t socklen = sizeof(*destaddr);
     int error         = 0;
 
+	// SO_ORIGINAL_DST 是通过内核连接跟踪(conntrack)的支持，读取到的REDIRECT前的原目的地址.
     error = getsockopt(fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, destaddr, &socklen);
     if (error) { // Didn't find a proper way to detect IP version.
         error = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, destaddr, &socklen);
@@ -186,6 +188,7 @@ create_and_bind(const char *addr, const char *port)
     return listen_sock;
 }
 
+// 转发关键路径 1/4: 收到局域网APP的数据.   收数据并转发一次.
 static void
 server_recv_cb(EV_P_ ev_io *w, int revents)
 {
@@ -195,6 +198,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
     ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
 
+    // 收到的局域网APP发的数据, 直接缓存到与ss-server交互的发送缓冲器. （稍后发给ss-server)
     ssize_t r = recv(server->fd, remote->buf->data + remote->buf->len,
                      BUF_SIZE - remote->buf->len, 0);
 
@@ -234,6 +238,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             port = ntohs(sa->sin6_port);
         }
 
+        // 打印的是下一跳目的地(ss-server)
         LOGI("redir to %s:%d, len=%zu, recv=%zd", ipstr, port, remote->buf->len, r);
     }
 
@@ -243,6 +248,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         return;
     }
 
+    // 加密
     int err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
 
     if (err) {
@@ -252,6 +258,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         return;
     }
 
+    // 发给ss-server.
+    // 注意这里仅仅send一次, 当remote->buf->len != s 时，剩余的数据怎么办？
+    // 答案是通过server_send_cb()在fd可写时继续发送.
     int s = send(remote->fd, remote->buf->data, remote->buf->len, 0);
 
     if (s == -1) {
@@ -279,6 +288,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     }
 }
 
+// 转发关键路径 4/4, 将缓冲器中残留的数据发给内网APP.
 static void
 server_send_cb(EV_P_ ev_io *w, int revents)
 {
@@ -355,6 +365,8 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
     close_and_free_server(EV_A_ server);
 }
 
+// 转发关键路径 3/4: 收到ss-server的回复.(ss-server转发的是真正服务器的回复)
+// 这里会先收ss-server的数据, 然后立即转发给内网APP.
 static void
 remote_recv_cb(EV_P_ ev_io *w, int revents)
 {
@@ -364,6 +376,9 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     ev_timer_again(EV_A_ & remote->recv_ctx->watcher);
 
+    // 收ss-server的回复.
+    // remote->fd 是和 ss-server通信的fd,在accept_cb()中调用new_remote()时设置的.
+    // 和1/4相同的套路，直接将数据缓存在了server->buf, 稍后立马send()给了内网APP.
     ssize_t r = recv(remote->fd, server->buf->data, BUF_SIZE, 0);
 
     if (r == 0) {
@@ -386,6 +401,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     server->buf->len = r;
 
+    // 解密(ss-server和ss-redir之间是加密链路)
     int err = crypto->decrypt(server->buf, server->d_ctx, BUF_SIZE);
     if (err == CRYPTO_ERROR) {
         LOGE("invalid password or cipher");
@@ -396,6 +412,9 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         return; // Wait for more
     }
 
+    // 将刚才收到的ss-server发过来的数据转发给内网APP
+    // server->fd和内网APP通信, 在accept_cb()中调用 new_server()时设置的
+    // 当server->buf->len != s时表示内核缓冲器满了, 数据先缓存到应用层server->buf, 等待server->fd的可写事件.可搜索注释 4/4
     int s = send(server->fd, server->buf->data, server->buf->len, 0);
 
     if (s == -1) {
@@ -426,6 +445,8 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     remote->recv_ctx->connected = 1;
 }
 
+// 转发关键路径 2/4:  将残留的数据发给ss-server
+// 1/4中虽然recv一次后立即send了一次,但是和ss-server的发送通道可能堵塞了导致内核缓冲区满, send有残留.
 static void
 remote_send_cb(EV_P_ ev_io *w, int revents)
 {
@@ -519,6 +540,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
         int s = -1;
 
         if (remote->addr != NULL) {
+            // 支持fast-open时, remote->addr才不为NULL. 表示需要和ss-server做一次connect
 #if defined(TCP_FASTOPEN_CONNECT)
             int optval = 1;
             if(setsockopt(remote->fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT,
@@ -535,6 +557,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             FATAL("tcp fast open is not supported on this platform");
 #endif
 
+            // 连接成功
             remote->addr = NULL;
 
             if (s == -1) {
@@ -706,6 +729,8 @@ close_and_free_server(EV_P_ server_t *server)
     }
 }
 
+// 被libev回调.
+// 接收从内核REDIRECT的包的, 新建连接的请求. 也就是监听fd有可读事件
 static void
 accept_cb(EV_P_ ev_io *w, int revents)
 {
@@ -715,12 +740,14 @@ accept_cb(EV_P_ ev_io *w, int revents)
 
     int err;
 
-    int serverfd = accept(listener->fd, NULL, NULL);
+    int serverfd = accept(listener->fd, NULL, NULL);            // serverfd 是和内网APP通信的数据fd
     if (serverfd == -1) {
         ERROR("accept");
         return;
     }
 
+    // 因为被Linux内核REDIRECT到了本机,现在五元组中的目的地址是本机IP.
+    // 那么如何找到真正的目的IP呢, 详见getdestaddr().
     err = getdestaddr(serverfd, &destaddr);
     if (err) {
         ERROR("getdestaddr");
@@ -735,8 +762,10 @@ accept_cb(EV_P_ ev_io *w, int revents)
 #endif
 
     int index                    = rand() % listener->remote_num;
-    struct sockaddr *remote_addr = listener->remote_addr[index];
 
+    // 1、remote_addr是和ss-redir配对的ss-server地址. ss-server部署在AWS/腾讯云上.
+    // 2、ss-redir 和 ss-server 之间形成的就是隧道.  remotefd就是连接ss-server的.
+    struct sockaddr *remote_addr = listener->remote_addr[index];
     int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
     if (remotefd == -1) {
         ERROR("socket");
@@ -797,8 +826,13 @@ accept_cb(EV_P_ ev_io *w, int revents)
     if (fast_open) {
         // save remote addr for fast open
         remote->addr = remote_addr;
-        ev_timer_start(EV_A_ & server->delayed_connect_watcher);
+        ev_timer_start(EV_A_ & server->delayed_connect_watcher);                        // 延迟connect, 实际上会调用 delayed_connect_cb()
     } else {
+        //!!! 和ss-server对接上了
+        // serverfd 与内网APP交互, remotefd 与ss-server交互.
+        // ss-redir经过两个步骤就完成了代理功能:
+        // ①将从serverfd收到的数据通过remotefd发出去(将内网APP的请求发往外网服务器).
+        // ②将从remotefd收到的数据通过serverfd发出去(将外网服务器的响应发往内网APP)
         int r = connect(remotefd, remote_addr, get_sockaddr_len(remote_addr));
 
         if (r == -1 && errno != CONNECT_IN_PROGRESS) {
@@ -807,10 +841,21 @@ accept_cb(EV_P_ ev_io *w, int revents)
             close_and_free_server(EV_A_ server);
             return;
         }
+
         // listen to remote connected event
+        // 在new_remote中注册了4个事件:
+        // ① EV_READ : remote_recv_cb(),    系统通知ss-server有发数据过来啦：接收的数据,解密,转发给内网APP
+        // ② EV_WRITE: remote_send_cb(),     (前面可能缓冲区满,没发干净)将缓冲器中残留的数据发给ss-server
+        // ③ send-timeout: remote_timeout_cb(), 发送超时?? todo 待后续分析
+        // ④ recv-timeout: remote_timeout_cb(), 长时间没有收到ss-server的数据的处理,此时可能ss-server异常了
+        //
         ev_io_start(EV_A_ & remote->send_ctx->io);
         ev_timer_start(EV_A_ & remote->send_ctx->watcher);
     }
+
+    // 在 new_server()中注册了需要监听的事件:
+    // ① EV_READ server_recv_cb()       系统通知内网APP有发数据过来啦：接收数据,加密,发给ss-server
+    // ② EV_WRITE server_send_cb()      (前面可能缓冲区满,没发干净)将缓冲器中残留的数据发给内网APP.
     ev_io_start(EV_A_ & server->recv_ctx->io);
 }
 
@@ -1201,6 +1246,10 @@ main(int argc, char **argv)
         if (mode != UDP_ONLY) {
             // Setup socket
             int listenfd;
+            /*
+             * local_addr和local_port是在 ss-redir 配置文件(或启动参数)中配置的 local_addr和local_port
+             * 所以, listenfd 监听的数据来自Linux内核的 TCP REDIRECT. （APP并不知道自己被内核REDIRECT了)
+             */
             listenfd = create_and_bind(local_addr, local_port);
             if (listenfd == -1) {
                 FATAL("bind() error");
@@ -1212,6 +1261,8 @@ main(int argc, char **argv)
 
             listen_ctx_current->fd = listenfd;
 
+            // libev机制, 管理fd的读写.
+            // tcp listenfd的可读事件也就是有新的连接来到, 也就是需要做accept()
             ev_io_init(&listen_ctx_current->io, accept_cb, listenfd, EV_READ);
             ev_io_start(loop, &listen_ctx_current->io);
         }
